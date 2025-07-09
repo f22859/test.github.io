@@ -1,0 +1,782 @@
+<!--
+ * micropad
+ * Copyright (c) 2025 secile
+ * This software is released under the MIT license.
+ * see https://opensource.org/licenses/MIT
+-->
+<!DOCTYPE html>
+<meta charset="UTF-8">
+<title>test</title>
+
+<style type="text/css">
+* {
+    font-size: 5vmin;
+}
+html {
+    touch-action:none;
+    user-select: none;
+}
+</style>
+
+<body>
+    <div style="position:absolute; left:10px; top:10px;">
+        <button type="button" id="connect"    onclick="connectBLE()">🚗</button>
+        <button type="button" id="disconnect" onclick="disconnectBLE()" disabled>🔚</button>
+    </div>
+    <canvas id="canvas"></canvas>
+</body>
+
+<script>
+
+//--- connect with microbit via bluetooth.
+let isConnected = false;
+let uBitDevice;
+let rxCharacteristic;
+
+async function connectBLE() {
+    const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const UART_TX_CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+    const UART_RX_CHARACTERISTIC_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    // +----------------------------+           +----------------------------+
+    // | [micro:bit, ESP32]         |           | [micropad on Smartphone]   |
+    // | as Peripheral.             |           | as Central.                |
+    // | do Advertise.              |           | do Scan.                   |
+    // | become Server.             |           | become Client.             |
+    // | expose Nordic UART Service.|           | connect to Service.        |
+    // | - TX (0002) [Nofity, CCCD] | --------> | - TX (0002) start notify.  |
+    // | - RX (0003) [Write]        | <-------- | - RX (0003) write value.   |
+    // +----------------------------+           +----------------------------+
+
+    if (isConnected) return;
+
+    try {
+        console.log("Requesting Bluetooth Device...");
+        uBitDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: "BBC micro:bit" }],
+            optionalServices: [UART_SERVICE_UUID]
+        });
+
+        uBitDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
+        console.log("Connecting to GATT Server...");
+        const server = await uBitDevice.gatt.connect();
+
+        console.log("Getting Service...");
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+
+        console.log("Getting Characteristics...");
+        // TX (0002) [micro:bit -> micropad]
+        const txCharacteristic = await service.getCharacteristic(UART_TX_CHARACTERISTIC_UUID);
+        txCharacteristic.startNotifications(); // start notification on server.
+        txCharacteristic.addEventListener("characteristicvaluechanged", onTxCharacteristicValueChanged);
+        // RX (0003) [micro:bit <- micropad]
+        rxCharacteristic = await service.getCharacteristic(UART_RX_CHARACTERISTIC_UUID);
+
+        isConnected = true;
+        document.getElementById('connect').disabled = true;
+        document.getElementById('disconnect').disabled = false;
+        console.log("Connected");
+    } catch (error) {
+        console.log(error);
+    }
+}
+
+function disconnectBLE() {
+    if (!uBitDevice) return;
+    
+    if (uBitDevice.gatt.connected) {
+    uBitDevice.gatt.disconnect();
+  }
+}
+
+// called when disconnected.
+function onDisconnected(event) {
+    let device = event.target;
+    console.log(`Device ${device.name} is disconnected.`);
+    isConnected = false;
+    document.getElementById('connect').disabled = false;
+    document.getElementById('disconnect').disabled = true;
+    console.log("Disconnected");
+}
+
+// send cmd and micro:bit receive data.
+async function sendBLE(cmd) {
+    // write log when micro:bit is not connected.
+    if (!isConnected) {
+        console.log(cmd);
+        return;
+    }
+    
+    enqueue(() => rxCharacteristic.writeValue(encoder.encode(cmd + "\n"))
+        .catch(error => console.error('error occured while writeValue:', error)));
+}
+const encoder = new TextEncoder();
+
+function enqueue(operation) {
+   queue = queue.then(operation, operation);
+   return queue;
+}
+let queue = Promise.resolve();
+
+// called when micro:bit send data.
+function onTxCharacteristicValueChanged(event) {
+	let receivedData = [];
+	for (var i = 0; i < event.target.value.byteLength; i++) {
+		receivedData[i] = event.target.value.getUint8(i);
+	}
+
+	const receivedString = String.fromCharCode.apply(null, receivedData);
+	console.log(receivedString);           // 'controlId:param'
+    let elems = receivedString.split(':'); // elems[0]=controlId, elems[1]=param
+    if (elems.length !== 2) return;        // ensure elems has 2 params.
+    ble_event.dispatchEvent(new CustomEvent('ble_received', { detail: elems }));
+}
+
+const ble_event = new EventTarget();
+function recvBLE(controlId, func) {
+    ble_event.addEventListener('ble_received', ev => {
+        const elems = ev.detail;
+        if (elems[0] !== controlId) return; // call func by controlID.
+        func(elems[1]);
+    });
+}
+
+//--- user interface.
+
+class AnalogStick {
+    // 初期化
+    constructor(canvas, context) {
+        this.canvas = canvas;
+        this.context = context;
+
+        // 中心座標。
+        this.setPosition(this.canvas.width / 2, this.canvas.height / 2);
+
+        // センター原点での座標。
+        this.posX = 0;
+        this.posY = 0;
+
+        // 円の表示
+        this.largeRadiusScale = 0.1;
+        this.smallRadiusScale = 0.05;
+        this.largeRadiusStyle = '#fde917';
+        this.smallRadiusStyle = 'mediumblue';
+
+        this.onChange = () => {}; // null guard.
+
+        // マウスイベントのインストール。
+        this.installMouseEvent();
+    }
+
+    get large_radius() {
+        return (this.canvas.width > this.canvas.height)?
+            this.canvas.width * this.largeRadiusScale:
+            this.canvas.height * this.largeRadiusScale;
+    }
+    get small_radius() {
+        return (this.canvas.width > this.canvas.height)?
+            this.canvas.width * this.smallRadiusScale:
+            this.canvas.height * this.smallRadiusScale;
+    }
+
+    get width()  { return 2 * this.large_radius; }
+    get height() { return 2 * this.large_radius; }
+
+    setPosition(x, y) {
+        this.centerX = x;
+        this.centerY = y;
+    }
+
+    // mousemove, mousedown, mouseupイベントのインストール。
+    // マルチタッチ対応できるように、pointerイベントに変更。
+    installMouseEvent() {
+        this.mousedown = false;
+        this.pointerId = 0;
+
+        window.addEventListener('pointerdown', ev => {
+            if (this.mouse_Drag(ev.offsetX, ev.offsetY, false)) { // clientX, clientYだとフォームの分ずれた。
+                this.mousedown = true;
+                this.pointerId = ev.pointerId;
+                this.mouse_Down();
+            }
+        });
+
+        window.addEventListener('pointermove', ev => {
+            if (this.mousedown && this.pointerId == ev.pointerId) {
+                this.mouse_Drag(ev.offsetX, ev.offsetY, true);
+                //console.log(this.name, "this.stickAngle", this.stickAngle, "this.stickPower", this.stickPower);
+            }
+        });
+
+        window.addEventListener('pointerup', ev => {
+            if (this.pointerId == ev.pointerId) {
+                this.mousedown = false;
+                this.pointerId = 0;
+                this.mouse_Up();
+                //console.log(this.name, "this.stickAngle", this.stickAngle, "this.stickPower", this.stickPower);
+            }
+        });
+    }
+
+    update() {
+        // do nothing.
+    }
+
+    mouse_Down() {
+        //console.log("mouse_Down");
+    }
+
+    mouse_Drag(x, y, updateStick) {
+        //console.log("mouse_Drag");
+
+        // センター原点での座標に変換。
+        const local_x =  x - this.centerX;
+        const local_y =  y - this.centerY;
+        const local_x2 = local_x * local_x;
+        const local_y2 = local_y * local_y;
+
+        const large_radius = this.large_radius;
+        const touch_radius = Math.min(Math.sqrt(local_x2 + local_y2), large_radius);
+        
+        // 大きな円の内側か？
+        const inside_radius_max = (local_x2 + local_y2 < large_radius * large_radius);
+
+        if (updateStick) {
+            // powerとangleを求める。
+            let power = touch_radius / large_radius;  // 中心からどれくらい離れているか? 0.0-1.0
+            let angle = Math.atan2(local_y, local_x); // X座標から時計回り! -π～+π
+            if (angle < 0) angle += 2*Math.PI;        // 0～2πに変換
+
+            // 画面の表示位置の更新。
+            this.posX = Math.cos(angle) * touch_radius;
+            this.posY = Math.sin(angle) * touch_radius;
+            
+            // 少し動くごとにonChangeせず、変化したらonChangedする。
+            let changed = false;
+            let angle8 = 0; // angle8方向。
+            let power3 = 0; // power3段階。
+
+            // powerは3段階に制限
+            if      (power < 0.33)  power3 = 0;
+            else if (power < 0.66)  power3 = 0.5;
+            else power3 = 1;
+            if (this.power3_Prev != power3) {
+                this.power3_Prev = power3;
+                changed = true;
+            }
+
+            // powerある時だけangle判定。
+            if (power3 != 0) {
+                // angleは8方向に制限する。
+                if      (1  * Math.PI / 8 <= angle && angle < 3  * Math.PI / 8) angle8 = 2  * Math.PI / 8;
+                else if (3  * Math.PI / 8 <= angle && angle < 5  * Math.PI / 8) angle8 = 4  * Math.PI / 8;
+                else if (5  * Math.PI / 8 <= angle && angle < 7  * Math.PI / 8) angle8 = 6  * Math.PI / 8;
+                else if (7  * Math.PI / 8 <= angle && angle < 9  * Math.PI / 8) angle8 = 8  * Math.PI / 8;
+                else if (9  * Math.PI / 8 <= angle && angle < 11 * Math.PI / 8) angle8 = 10 * Math.PI / 8;
+                else if (11 * Math.PI / 8 <= angle && angle < 13 * Math.PI / 8) angle8 = 12 * Math.PI / 8;
+                else if (13 * Math.PI / 8 <= angle && angle < 15 * Math.PI / 8) angle8 = 14 * Math.PI / 8;
+                else angle8 = 0;
+                angle8 = Math.round(angle8 * 100) / 100; // 3.14のように少数第2位で四捨五入。
+                if (this.angle8_Prev != angle8) {
+                    this.angle8_Prev = angle8;
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                this.onChange(angle8, power3);
+            }
+        }
+
+        return inside_radius_max;
+    }
+
+    mouse_Up() {
+        //console.log("mouse_Up");
+
+        // 表示位置を原点に戻す。
+        this.posX = 0;
+        this.posY = 0;
+
+        this.onChange(0, 0);
+    }
+
+    draw() {
+
+        // 大きな円をセンターに。
+        this.context.save();
+        {
+            this.context.fillStyle = this.largeRadiusStyle;
+            this.context.globalAlpha = 0.5; // 50%の透明度
+
+            this.context.translate(this.centerX, this.centerY)
+            this.context.beginPath();
+            this.context.arc(0, 0, this.large_radius, 0, 2 * Math.PI);
+            this.context.closePath();
+            this.context.fill();
+        }
+        this.context.restore();
+
+        // 小さな円をセンター中心で(pos_x, pos_y)に。
+        this.context.save();
+        {
+            this.context.fillStyle = this.smallRadiusStyle;
+            this.context.globalAlpha = 0.5; // 50%の透明度
+
+            this.context.translate(this.centerX, this.centerY)
+            this.context.translate(this.posX, this.posY)
+            this.context.beginPath();
+            this.context.arc(0, 0, this.small_radius, 0, 2 * Math.PI);
+            this.context.closePath();
+            this.context.fill();
+        }
+        this.context.restore();
+    }
+}
+
+class Button {
+    // 初期化
+    constructor(canvas, context) {
+        this.canvas = canvas;
+        this.context = context;
+
+        // 表示
+        this.fontName = 'Arial, Roboto, "Droid Sans", "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Meiryo", sans-serif';
+        this.fontScale = 1.0;
+        this.fontFillStyle = "white";   // text color.
+        this.fontStrokeStyle = "red"; // not used.
+        this.backFillStyle = 'skyblue';     // button back
+        this.backActiveStyle = 'LightSkyBlue' // button back(active)
+        this.backStrokeStyle = "white";        // button border.
+        this.text = "button";
+
+        // 中心座標。(width, heightも更新。)
+        this.setPosition(this.canvas.width / 2, this.canvas.height / 2);
+
+        // 状態。
+        this.noBorder = false;
+        this.toggle = false;
+        this.onChange = () => {}; // null guard.
+
+        // マウスイベントのインストール。
+        this.installMouseEvent();
+    }
+
+    get is_active() {
+        if (this.toggle) return this.checked;
+        else return this.mousedown;
+    }
+
+    get checked() { return this._checked; }
+    set checked(flag) {
+        this._checked = flag;
+        this.onChange(flag);
+    }
+
+    setPosition(x, y) {
+        this.centerX = x;
+        this.centerY = y;
+        this.updateSize();
+    }
+
+    updateSize() {
+        const size = Math.max(this.canvas.width, this.canvas.height);
+        this.fontSize = size / 10 * this.fontScale;
+
+        // 描画サイズを取得する。
+        this.context.save();
+        this.context.font = `${this.fontSize}px ${this.fontName}`;
+        const metrics = this.context.measureText(this.text);
+        this.width = metrics.width;
+        this.height = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent;
+        
+        const metrics1 = this.context.measureText(' '); 
+        this.padding = metrics1.width;  
+    }
+
+    // mousemove, mousedown, mouseupイベントのインストール。
+    // マルチタッチ対応できるように、pointerイベントに変更。
+    installMouseEvent() {
+        this.mousedown = false;
+        this.pointerId = 0;
+
+        window.addEventListener('pointerdown', ev => {
+            if (this.is_mouse_over(ev.offsetX, ev.offsetY)) {
+                this.mousedown = true;
+                this.pointerId = ev.pointerId;
+
+                if (!this.toggle) {
+                    this.onChange(true);
+                } else {
+                    this.checked = !this.checked;
+                    //this.onChange(this.checked); executed in checked property set.
+                }
+            }
+        });
+
+        window.addEventListener('pointerup', ev => {
+            if (this.mousedown = true && this.pointerId == ev.pointerId) {
+                this.mousedown = false;
+                this.pointerId = 0;
+                
+                if (!this.toggle) {
+                    this.onChange(false);
+                }
+            }
+        });
+    }
+
+    is_mouse_over(x, y) {
+        const w = this.width + this.padding;
+        const h = this.height + this.padding;
+        const l = this.centerX - w / 2;
+        const r = this.centerX + w / 2;
+        const t = this.centerY - h / 2;
+        const b = this.centerY + h / 2;
+        return (l < x && x < r && t < y && y < b);
+    }
+
+    update() {
+        // do nothing.
+    }
+
+    draw() {
+        this.context.save();
+        {
+            // 中心を移動。→この方法ではButtonの中心にテキストを描画するのが難しかったのでコメントアウト。
+            //this.context.translate(this.centerX, this.centerY);
+
+            // 角丸を描画。
+            if (!this.noBorder) {
+            this.context.lineWidth = this.height * (this.is_active? 0.1: 0.02); // this.widthは不自然。this.heightを使う。
+            this.context.fillStyle = this.is_active? this.backActiveStyle: this.backFillStyle;
+            this.context.strokeStyle = this.backStrokeStyle;
+            this.roundedRect(this.centerX, this.centerY, this.width+this.padding, this.height+this.padding, this.height*0.2);
+            }
+
+            // テキストを描画。
+            this.context.fillStyle = this.fontFillStyle;
+            this.context.strokeStyle = this.fontStrokeStyle;
+            this.context.font = `${this.fontSize}px ${this.fontName}`;
+            this.context.textAlign = 'center';
+            this.context.fillText(this.text, this.centerX, this.centerY+this.height/2);
+        }
+        this.context.restore();
+    }
+
+    roundedRect(center_x, center_y, width, height, radius) {
+        const x = center_x - width / 2;
+        const y = center_y - height / 2;
+        this.context.save();
+        this.context.beginPath();
+        this.context.moveTo(x, y + radius);
+        this.context.arcTo(x, y + height, x + radius, y + height, radius);
+        this.context.arcTo(x + width, y + height, x + width, y + height - radius, radius);
+        this.context.arcTo(x + width, y, x + width - radius, y, radius);
+        this.context.arcTo(x, y, x, y + radius, radius);
+        this.context.closePath();
+        this.context.stroke(); // 枠線を描画。
+        this.context.fill(); // 塗りつぶす。
+        this.context.restore();
+    }
+}
+
+class Label extends Button {
+    constructor(canvas, context) {
+        super(canvas, context);
+        this.noBorder = true;
+        this.fontScale = 0.5; // little smaller than Button.
+    }
+}
+
+class Slider {
+    // 初期化
+    constructor(canvas, context) {
+        this.canvas = canvas;
+        this.context = context;
+
+        // 中心座標。
+        this.setPosition(
+            this.canvas.width / 2,
+            this.canvas.height / 2,
+            this.canvas.width * 0.2
+        );
+
+        // 表示。
+        this.lineWidth = 0.5;  // ratio to knob scale.
+        this.knobScale = 0.05; // ratio to max(canvas.width, canvas.height).
+        this.lineStyle = '#456882';
+        this.knobStyle = 'blue';
+
+        // 動作。
+        this.sliderValue = 0;
+        this.onChange = () => {}; // null guard.
+
+        // マウスイベントのインストール。
+        this.installMouseEvent();
+    }
+
+    setPosition(x, y, width) {
+        this.centerX = x;
+        this.centerY = y;
+        this.sliderWidth = width;
+        this.sliderLeft  = this.centerX - (this.sliderWidth / 2);
+        this.sliderRight = this.centerX + (this.sliderWidth / 2);
+    }
+
+    get width() { return this.sliderWidth; }
+    get height() { return this.radius * 2; }
+    get radius() {
+        const width = this.canvas.width;
+        const height = this.canvas.height;
+        const radius = (width > height)? width * this.knobScale: height * this.knobScale;
+        return radius;
+    }
+
+    get value() { return this.sliderValue; }
+    set value(value) {
+        this.sliderValue = value;
+        this.onChange(value);
+    }
+
+    // mousemove, mousedown, mouseupイベントのインストール。
+    // マルチタッチ対応できるように、pointerイベントに変更。
+    installMouseEvent() {
+        this.mousedown = false;
+        this.pointerId = 0;
+
+        window.addEventListener('pointerdown', ev => {
+            if (this.mouse_Drag(ev.offsetX, ev.offsetY, false)) { // clientX, clientYだとフォームの分ずれた。
+                this.mousedown = true;
+                this.pointerId = ev.pointerId;
+                this.mouse_Down();
+            }
+        });
+
+        window.addEventListener('pointermove', ev => {
+            if (this.mousedown && this.pointerId == ev.pointerId) {
+                this.mouse_Drag(ev.offsetX, ev.offsetY, true);
+                //console.log(this.name, "this.stickAngle", this.stickAngle, "this.stickPower", this.stickPower);
+            }
+        });
+
+        window.addEventListener('pointerup', ev => {
+            if (this.pointerId == ev.pointerId) {
+                this.mousedown = false;
+                this.pointerId = 0;
+                this.mouse_Up();
+                //console.log(this.name, "this.stickAngle", this.stickAngle, "this.stickPower", this.stickPower);
+            }
+        });
+    }
+
+    update() {
+        // do nothing.
+    }
+
+    mouse_Down() {
+        //console.log("mouse_Down");
+    }
+
+    mouse_Drag(x, y, updateStick) {
+        //console.log("mouse_Drag");
+
+        // インジケーター原点での座標に変換。
+        const local_x =  x - this.centerX;
+        const local_y =  y - this.centerY;
+        const local_x2 = local_x * local_x;
+        const local_y2 = local_y * local_y;
+        const radius = this.radius;
+
+        // インジケーターの内側か？
+        const inside_radius = (local_x2 + local_y2 < radius * radius);
+
+        if (updateStick) {
+            // valueの更新。
+            const power = x - this.sliderLeft;
+            this.sliderValue = power / this.sliderWidth;
+            if (this.sliderValue < 0) this.sliderValue = 0;
+            if (this.sliderValue > 1) this.sliderValue = 1;
+            
+            // onChangedは0.1ごとに。
+            let value = Math.round(this.sliderValue * 10) / 10; // 少数第1位で四捨五入。
+            if (this.value_Prev != value) {
+                this.value_Prev = value;
+                this.onChange(value);
+            }
+        }
+
+        return inside_radius;
+    }
+
+    mouse_Up() {
+        //console.log("mouse_Up");
+    }
+
+    draw() {
+        const radius = this.radius;
+
+        // ライン。
+        this.context.save();
+        {
+            this.context.strokeStyle = this.lineStyle;
+            this.context.globalAlpha = 0.5; // 透明度
+
+            this.context.lineWidth = radius * this.lineWidth;
+            context.lineCap = 'round';
+            this.context.beginPath();
+            this.context.moveTo(this.sliderLeft, this.centerY);
+            this.context.lineTo(this.sliderRight, this.centerY);
+            this.context.stroke();
+            this.context.closePath();
+        }
+        this.context.restore();
+
+        // 小さな円。
+        this.context.save();
+        {
+            this.context.fillStyle = this.knobStyle;
+            this.context.globalAlpha = 0.9; // 透明度
+
+            // valueから表示位置を更新。
+            this.centerX = this.sliderLeft + this.sliderWidth * this.sliderValue;
+            this.context.translate(this.centerX, this.centerY)
+            this.context.beginPath();
+            this.context.arc(0, 0, radius, 0, 2 * Math.PI);
+            this.context.closePath();
+            this.context.fill();
+        }
+        this.context.restore();
+    }
+}
+
+// suppress context menu.
+document.oncontextmenu = () => false;
+
+const canvas = document.querySelector('#canvas');
+const context = canvas.getContext('2d');
+const controls = initControl();
+
+// start animation.
+requestAnimationFrame(updateFrame);
+
+// update frame.
+function updateFrame() {
+    update();
+    draw();
+    requestAnimationFrame(updateFrame);
+}
+
+// init controls.
+function initControl() {
+    let result = [];
+
+    window.addEventListener('resize', () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    });
+
+    // Label.
+    const label = new Label(canvas, context);
+    label.text = "";
+    label.fontScale = 0.3;
+    label.fontFillStyle = "PowderBlue";
+    result.push(label);
+    window.addEventListener('resize', () => {
+        label.setPosition(canvas.width * 0.5, canvas.height * 0.6);
+    });
+    // update label when receive text from micro:bit.
+    this.recvBLE('l1', param => {
+        label.text = `value:${param}`;
+    });
+
+    // AnalogStick 1.
+    const stick1 = new AnalogStick(canvas, context);
+    stick1.onChange = (angle, power) => {
+        const cmd = `a1,${angle},${power}`;
+        this.sendBLE(cmd)
+    };
+    result.push(stick1);
+    window.addEventListener('resize', () => {
+        stick1.setPosition(canvas.width * 0.25, canvas.height / 2);
+    });
+
+    // AnalogStick 2.
+    const stick2 = new AnalogStick(canvas, context);
+    stick2.onChange = (angle, power) => {
+        const cmd = `a2,${angle},${power}`;
+        this.sendBLE(cmd)
+    };
+    result.push(stick2);
+    window.addEventListener('resize', () => {
+        stick2.setPosition(canvas.width * 0.75, canvas.height / 2);
+    });
+
+    // Button 1.
+    const button1 = new Button(canvas, context);
+    button1.text = "X";
+    button1.onChange = (flag) => {
+        const cmd = `b1,${flag? 1: 0},0`;
+        this.sendBLE(cmd)
+    };
+    result.push(button1);
+    window.addEventListener('resize', () => {
+        button1.setPosition(canvas.width * 0.2, canvas.height / 2 + stick1.height * 1.00);
+    });
+
+    // Button 2. (toggle)
+    const button2 = new Button(canvas, context);
+    button2.text = "Y";
+    button2.onChange = (flag) => {
+        const cmd = `b2,${flag? 1: 0},0`;
+        this.sendBLE(cmd)
+    };
+    result.push(button2);
+    window.addEventListener('resize', () => {
+        button2.setPosition(canvas.width * 0.8, canvas.height / 2 + stick2.height * 1.00);
+    });
+    // toggle mode.
+    button2.toggle = true;
+    // set default value.
+    // button2.checked = true;
+
+    // Slider.
+    const slider1 = new Slider(canvas, context);
+    slider1.knobStyle = 'crimson';
+    slider1.onChange = (value) => {
+        const cmd = `s1,${value},0`;
+        this.sendBLE(cmd)
+    };
+    result.push(slider1);
+    window.addEventListener('resize', () => {
+        slider1.setPosition(canvas.width * 0.5, canvas.height / 2 - stick2.height * 0.75, canvas.width * 0.75);
+    });
+    // set default value.
+    slider1.value = 0.5;
+
+    // trigger 'resize' event to layout control.
+    window.dispatchEvent(new Event('resize'));
+
+    return result;
+}
+
+function update() {
+    // update all controls.
+    for(let item of controls) {
+        item.update();
+    }
+}
+
+function draw() {    
+    // clear screen.
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.style.backgroundColor = "#66A5AD";
+
+    // draw all controls.
+    for(let item of controls) {
+        item.draw();
+    }
+}
+
+</script>
